@@ -3,11 +3,11 @@
 *.xlsx
 *.xls
 
-# Os CSVs de teste são fictícios e podem ser versionados.
-!teste/*.csv
-
 # Sistema e Vercel
 .DS_Store
 Thumbs.db
 desktop.ini
 .vercel
+
+# Planilha .xlsx de teste (fictícia) também pode ser versionada.
+!teste/*.xlsx

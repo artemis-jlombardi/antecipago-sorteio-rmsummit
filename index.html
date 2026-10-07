@@ -300,12 +300,12 @@ body.sem-cursor, body.sem-cursor *{cursor:none !important}
 
       <div class="cartao">
         <h2>Participantes</h2>
-        <p class="dica">Carregue o CSV exportado do Google Forms.</p>
+        <p class="dica">Carregue a planilha do Google Forms (.xlsx ou CSV).</p>
 
         <label class="soltar" id="soltar">
-          <input type="file" id="arquivo" accept=".csv,text/csv,.txt" hidden>
+          <input type="file" id="arquivo" accept=".csv,text/csv,.txt,.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" hidden>
           <div class="icone"></div>
-          <strong id="soltar-titulo">Arraste o arquivo CSV para cá</strong>
+          <strong id="soltar-titulo">Arraste a planilha para cá</strong>
           <span id="soltar-sub">ou clique para escolher</span>
         </label>
         <div class="erro" id="erro"></div>
@@ -314,7 +314,7 @@ body.sem-cursor, body.sem-cursor *{cursor:none !important}
           <div class="numeros">
             <div class="numero"><b id="n-linhas">0</b><span>respostas no arquivo</span></div>
             <div class="numero"><b id="n-incompletos">0</b><span>sem nome ou sem telefone</span></div>
-            <div class="numero"><b id="n-repetidos">0</b><span>telefones repetidos</span></div>
+            <div class="numero"><b id="n-repetidos">0</b><span>repetidos (telefone ou CPF)</span></div>
           </div>
           <div class="destaque"><b id="n-validos">0</b><span>participantes<br>no sorteio</span></div>
           <div class="acoes-setup">
@@ -498,6 +498,9 @@ var Logica = (function () {
       ]),
       email: acha([
         function (x) { return /\be-?mail\b/.test(x); }
+      ]),
+      cpf: acha([
+        function (x) { return /\bcpf\b/.test(x); }
       ])
     };
   }
@@ -513,6 +516,23 @@ var Logica = (function () {
     if (d.length === 11) return '(' + d.slice(0, 2) + ') ' + d.slice(2, 7) + '-' + d.slice(7);
     if (d.length === 10) return '(' + d.slice(0, 2) + ') ' + d.slice(2, 6) + '-' + d.slice(6);
     return d;
+  }
+
+  // CPF: só dígitos. O Excel guarda CPF como número e apaga zeros da frente; repõe até 11.
+  function normalizaCPF(s) {
+    var d = String(s == null ? '' : s).replace(/\D/g, '');
+    if (d.length === 9 || d.length === 10) d = ('00' + d).slice(-11);
+    return d;
+  }
+
+  function formataCPF(d) {
+    if (d && d.length === 11) return d.slice(0, 3) + '.' + d.slice(3, 6) + '.' + d.slice(6, 9) + '-' + d.slice(9);
+    return d || '';
+  }
+
+  // "1,19877E+10": número que o Excel já cortou ao salvar CSV. Não dá para recuperar.
+  function cientifico(s) {
+    return /^\s*-?[\d.,]+\s*e\s*[+-]?\d+\s*$/i.test(String(s == null ? '' : s));
   }
 
   var MINUSCULAS = { 'da': 1, 'das': 1, 'de': 1, 'do': 1, 'dos': 1, 'e': 1, 'di': 1, 'du': 1, 'del': 1 };
@@ -533,10 +553,10 @@ var Logica = (function () {
     }).join(' ');
   }
 
-  // Lê o CSV inteiro e devolve participantes limpos e os números da limpeza.
-  function limpar(texto) {
-    var linhas = lerCSV(texto);
-    while (linhas.length && linhas[0].every(function (c) { return !String(c).trim(); })) linhas.shift();
+  // Recebe as linhas (CSV ou planilha) e devolve participantes limpos e os números da limpeza.
+  function limparLinhas(linhas) {
+    linhas = linhas.map(function (l) { return l.map(function (c) { return c == null ? '' : String(c); }); });
+    while (linhas.length && linhas[0].every(function (c) { return !c.trim(); })) linhas.shift();
     if (!linhas.length) return { erro: 'O arquivo está vazio.' };
 
     var cab = linhas[0], col = encontraColunas(cab);
@@ -545,38 +565,148 @@ var Logica = (function () {
     if (col.telefone < 0) faltando.push('telefone');
     if (faltando.length) {
       return { erro: 'Não encontrei a coluna de ' + faltando.join(' nem a de ') +
-        '. Confira se é o CSV exportado do Google Forms.' };
+        '. Confira se é a planilha de respostas do Google Forms.' };
     }
 
-    var vistos = {}, participantes = [];
+    for (var k = 1; k < linhas.length; k++) {
+      if (cientifico(linhas[k][col.telefone]) || (col.cpf >= 0 && cientifico(linhas[k][col.cpf]))) {
+        return { erro: 'Este arquivo veio com telefone ou CPF em notação científica (ex.: 1,19E+10): ' +
+          'o Excel cortou os números ao salvar. Carregue a planilha .xlsx original ou o CSV baixado direto do Google.' };
+      }
+    }
+
+    var telVisto = {}, cpfVisto = {}, participantes = [];
     var stats = { linhas: 0, incompletos: 0, repetidos: 0, validos: 0 };
 
     for (var i = 1; i < linhas.length; i++) {
       var l = linhas[i];
-      if (l.every(function (c) { return !String(c).trim(); })) continue; // linha em branco não conta
+      if (l.every(function (c) { return !c.trim(); })) continue; // linha em branco não conta
       stats.linhas++;
       var nome = formataNome(l[col.nome]);
       var tel = normalizaTelefone(l[col.telefone]);
+      var cpf = col.cpf >= 0 ? normalizaCPF(l[col.cpf]) : '';
       if (!nome || !tel) { stats.incompletos++; continue; }
-      if (vistos[tel]) { stats.repetidos++; continue; }
-      vistos[tel] = true;
+      // Mesma pessoa: mesmo telefone OU mesmo CPF. Fica a primeira que aparece no arquivo.
+      if (telVisto[tel] || (cpf && cpfVisto[cpf])) { stats.repetidos++; continue; }
+      telVisto[tel] = true;
+      if (cpf) cpfVisto[cpf] = true;
       participantes.push({
         id: participantes.length + 1,
         nome: nome,
         tel: tel,
-        email: col.email >= 0 ? String(l[col.email] || '').trim() : ''
+        email: col.email >= 0 ? String(l[col.email] || '').trim() : '',
+        cpf: cpf
       });
     }
     stats.validos = participantes.length;
+    function nomeCol(c) { return c >= 0 ? String(cab[c]).trim() : null; }
     return {
       participantes: participantes,
       stats: stats,
-      colunas: {
-        nome: String(cab[col.nome]).trim(),
-        telefone: String(cab[col.telefone]).trim(),
-        email: col.email >= 0 ? String(cab[col.email]).trim() : null
-      }
+      colunas: { nome: nomeCol(col.nome), telefone: nomeCol(col.telefone), email: nomeCol(col.email), cpf: nomeCol(col.cpf) }
     };
+  }
+
+  function limpar(texto) { return limparLinhas(lerCSV(texto)); }
+
+  // ------------------------------------------------------------------
+  // PLANILHA .xlsx: abre o zip e lê o XML sem biblioteca nenhuma.
+  // Usa DecompressionStream do próprio navegador (funciona offline).
+  // ------------------------------------------------------------------
+  function desescapa(t) {
+    return t.replace(/&(#x[0-9a-f]+|#\d+|amp|lt|gt|quot|apos);/gi, function (m, e) {
+      var n = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" }[e.toLowerCase()];
+      if (n) return n;
+      return String.fromCodePoint(e[1] === 'x' || e[1] === 'X' ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10));
+    });
+  }
+  function textoRico(xml) {
+    var out = '', m, re = /<t\b[^>]*>([\s\S]*?)<\/t>/g;
+    xml = xml.replace(/<rPh\b[\s\S]*?<\/rPh>/g, '');
+    while ((m = re.exec(xml))) out += m[1];
+    return desescapa(out);
+  }
+  // Número da planilha como texto, sem notação científica: 1.1987654321E10 -> "11987654321".
+  function numeroParaTexto(v) {
+    if (/^-?\d+(\.\d+)?(e[+-]?\d+)?$/i.test(v)) {
+      var n = Number(v);
+      if (Number.isInteger(n) && Math.abs(n) < 1e21) return n.toFixed(0);
+    }
+    return v;
+  }
+  function indiceColuna(ref) {
+    var letras = /^[A-Z]+/i.exec(ref)[0].toUpperCase(), n = 0;
+    for (var i = 0; i < letras.length; i++) n = n * 26 + (letras.charCodeAt(i) - 64);
+    return n - 1;
+  }
+
+  async function abrirZip(buf) {
+    var b = new Uint8Array(buf), dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+    var dec = new TextDecoder('utf-8'), fim = -1, arquivos = {};
+    for (var i = b.length - 22; i >= Math.max(0, b.length - 65557); i--) {
+      if (dv.getUint32(i, true) === 0x06054b50) { fim = i; break; }
+    }
+    if (fim < 0) throw new Error('não é um zip');
+    var total = dv.getUint16(fim + 10, true), p = dv.getUint32(fim + 16, true);
+    for (var k = 0; k < total; k++) {
+      if (dv.getUint32(p, true) !== 0x02014b50) throw new Error('zip inválido');
+      var nl = dv.getUint16(p + 28, true), xl = dv.getUint16(p + 30, true), cl = dv.getUint16(p + 32, true);
+      arquivos[dec.decode(b.subarray(p + 46, p + 46 + nl))] = {
+        metodo: dv.getUint16(p + 10, true), tam: dv.getUint32(p + 20, true), local: dv.getUint32(p + 42, true)
+      };
+      p += 46 + nl + xl + cl;
+    }
+    return async function ler(nome) {
+      var a = arquivos[nome];
+      if (!a) return null;
+      var ini = a.local + 30 + dv.getUint16(a.local + 26, true) + dv.getUint16(a.local + 28, true);
+      var dados = b.subarray(ini, ini + a.tam);
+      if (a.metodo === 0) return dec.decode(dados);
+      if (a.metodo !== 8) throw new Error('compressão não suportada');
+      var fluxo = new Blob([dados]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+      return dec.decode(new Uint8Array(await new Response(fluxo).arrayBuffer()));
+    };
+  }
+
+  // Devolve as linhas da primeira aba como listas de texto, igual ao lerCSV.
+  async function lerXLSX(buf) {
+    var ler = await abrirZip(buf);
+    var caminho = 'xl/worksheets/sheet1.xml';
+    var wb = await ler('xl/workbook.xml'), rels = await ler('xl/_rels/workbook.xml.rels');
+    var rid = wb && (/<sheet\b[^>]*\br:id="([^"]+)"/.exec(wb) || [])[1];
+    if (rid && rels) {
+      var m, re = /<Relationship\b[^>]*>/g;
+      while ((m = re.exec(rels))) {
+        var id = (/\bId="([^"]+)"/.exec(m[0]) || [])[1], alvo = (/\bTarget="([^"]+)"/.exec(m[0]) || [])[1];
+        if (id === rid && alvo) { caminho = alvo.charAt(0) === '/' ? alvo.slice(1) : 'xl/' + alvo.replace(/^\.\//, ''); break; }
+      }
+    }
+    var folha = await ler(caminho);
+    if (!folha) throw new Error('aba não encontrada');
+
+    var compartilhados = [], sx = await ler('xl/sharedStrings.xml');
+    if (sx) { var ms, rs = /<si\b[^>]*>([\s\S]*?)<\/si>/g; while ((ms = rs.exec(sx))) compartilhados.push(textoRico(ms[1])); }
+
+    var linhas = [], mr, rr = /<row\b[^>]*>([\s\S]*?)<\/row>/g;
+    while ((mr = rr.exec(folha))) {
+      var linha = [], mc, rc = /<c\b([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g, seq = 0;
+      while ((mc = rc.exec(mr[1]))) {
+        var attrs = mc[1], corpo = mc[2] || '';
+        var ref = (/\br="([A-Z]+\d+)"/i.exec(attrs) || [])[1];
+        var idx = ref ? indiceColuna(ref) : seq;
+        seq = idx + 1;
+        var t = (/\bt="([^"]+)"/.exec(attrs) || [])[1] || 'n';
+        var v = (/<v>([\s\S]*?)<\/v>/.exec(corpo) || [])[1];
+        var valor = '';
+        if (t === 's') valor = v != null ? (compartilhados[parseInt(v, 10)] || '') : '';
+        else if (t === 'inlineStr') valor = textoRico((/<is>([\s\S]*?)<\/is>/.exec(corpo) || ['', ''])[1]);
+        else if (v != null) valor = t === 'n' ? numeroParaTexto(v) : desescapa(v);
+        while (linha.length < idx) linha.push('');
+        linha[idx] = valor;
+      }
+      linhas.push(linha);
+    }
+    return linhas;
   }
 
   // Inteiro uniforme em [0, n) com crypto.getRandomValues, sem viés de módulo.
@@ -590,7 +720,8 @@ var Logica = (function () {
   return {
     normalizaCabecalho: normalizaCabecalho, lerCSV: lerCSV, encontraColunas: encontraColunas,
     normalizaTelefone: normalizaTelefone, formataTelefone: formataTelefone, formataNome: formataNome,
-    limpar: limpar, sorteiaIndice: sorteiaIndice
+    normalizaCPF: normalizaCPF, formataCPF: formataCPF,
+    limpar: limpar, limparLinhas: limparLinhas, lerXLSX: lerXLSX, sorteiaIndice: sorteiaIndice
   };
 })();
 </script>
@@ -826,9 +957,9 @@ var FOTOS = {
       $('n-repetidos').textContent = s.repetidos.toLocaleString('pt-BR');
       $('n-validos').textContent = s.validos.toLocaleString('pt-BR');
       $('soltar-titulo').textContent = 'Trocar o arquivo';
-      $('soltar-sub').textContent = 'arraste outro CSV ou clique para escolher';
+      $('soltar-sub').textContent = 'arraste outra planilha ou clique para escolher';
     } else {
-      $('soltar-titulo').textContent = 'Arraste o arquivo CSV para cá';
+      $('soltar-titulo').textContent = 'Arraste a planilha para cá';
       $('soltar-sub').textContent = 'ou clique para escolher';
     }
     $('soltar').classList.toggle('compacto', tem);
@@ -848,9 +979,17 @@ var FOTOS = {
   function lerArquivo(arq) {
     if (estado.fase !== 'setup') return;
     erro('');
+    if (/\.xls$/i.test(arq.name)) { erro('Este é o formato antigo do Excel (.xls). Salve como .xlsx ou CSV.'); return; }
     var r = new FileReader();
-    r.onload = function () {
-      var res = Logica.limpar(decodificar(r.result));
+    r.onload = async function () {
+      var b = new Uint8Array(r.result), res;
+      var planilha = b[0] === 0x50 && b[1] === 0x4B; // "PK": .xlsx é um zip
+      try {
+        res = planilha ? Logica.limparLinhas(await Logica.lerXLSX(r.result)) : Logica.limpar(decodificar(r.result));
+      } catch (e) {
+        erro('Não consegui ler esta planilha. Tente exportar de novo como .xlsx ou CSV.');
+        return;
+      }
       if (res.erro) { erro(res.erro); return; }
       if (!res.participantes.length) { erro('Nenhum participante válido no arquivo.'); return; }
       estado.participantes = res.participantes;
@@ -1081,7 +1220,7 @@ var FOTOS = {
   });
 
   // ------------------------------------------------------------------------
-  // FIM e cópia dos dados (telefone e e-mail nunca aparecem na tela)
+  // FIM e cópia dos dados (telefone, e-mail e CPF nunca aparecem na tela)
   // ------------------------------------------------------------------------
   function desenharFim() {
     var lista = $('lista-ganhadores');
@@ -1101,10 +1240,10 @@ var FOTOS = {
   }
 
   function linhaCopia(i, g) {
-    return [ordinal(i) + ': ' + PREMIOS[i].nome, g.nome, Logica.formataTelefone(g.tel), g.email].join('\t');
+    return [ordinal(i) + ': ' + PREMIOS[i].nome, g.nome, Logica.formataTelefone(g.tel), g.email, Logica.formataCPF(g.cpf)].join('\t');
   }
   function textoCopia() {
-    var linhas = ['Prêmio\tNome\tTelefone\tE-mail'];
+    var linhas = ['Prêmio\tNome\tTelefone\tE-mail\tCPF'];
     PREMIOS.forEach(function (p, i) {
       var g = ganhadorDo(i);
       if (g) linhas.push(linhaCopia(i, g));
